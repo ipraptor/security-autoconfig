@@ -37,6 +37,7 @@ else
   fi
   
   # Обновление конфигурации SSH
+  sed -i 's/^#*PubkeyAuthentication yes.*/PubkeyAuthentication yes/' $SSH_CONFIG_FILE
   sed -i 's/^#*ClientAliveInterval.*/ClientAliveInterval 300/' $SSH_CONFIG_FILE
   sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' $SSH_CONFIG_FILE
   sed -i 's/^#*Protocol.*/Protocol 2/' $SSH_CONFIG_FILE
