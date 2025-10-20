@@ -143,7 +143,7 @@ run_cli_checklist(){
 run_tui_checklist(){
   local tf; tf="$(mktemp)"
   if [ "$TUI" = "whiptail" ]; then
-    whiptail --title "OpenSSH Hardening" --separate-output \
+    whiptail --title "OpenSSH Hardening by Expice Security" --separate-output \
       --checklist "Select actions:" 22 78 12 \
       CORE     "Core sshd hardening (CIS basics)"           ON \
       KEYONLY  "Key-only auth (PasswordAuthentication no)"  ON \
