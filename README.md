@@ -144,4 +144,4 @@ Email: info@expice.ru
 ---
 
 ## Лицензия / License
-MIT License. Добавьте файл `LICENSE` в корень репозитория.
+MIT License.
