@@ -1,156 +1,453 @@
 #!/usr/bin/env bash
 #==========================================
-#  Automates CIS-compatible hardening OpenSSH:
-#  makes backups, edits sshd_config, sets TMOUT,
-#  creates a banner, adds a local audit rule,
-#  validates the config, and restarts ssh/sshd if agreed.
-#
-#  Anton Palamarchuk (info@expice.ru) 14102025
+#  OpenSSH CIS Audit + Interactive Fix — Expice Security
+#  Anton Palamarchuk (info@expice.ru) 080726
 #==========================================
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin/:/root/bin
 
-# Re-exec with bash if started via sh
-if [ -z "${BASH_VERSION:-}" ]; then
-  printf '%s\n' "This script requires bash. Re-executing with bash..." >&2
-  exec /usr/bin/env bash "$0" "$@"
-  printf '%s\n' "Failed to re-exec with bash. Install bash and run: bash $0" >&2
-  exit 127
-fi
+if [ -z "${BASH_VERSION:-}" ]; then exec /usr/bin/env bash "$0" "$@"; fi
 
 set -Eeuo pipefail
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/root/bin
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/bin
 
-# Colors
-if [ -t 1 ]; then RED=$'\033[31m'; GRN=$'\033[32m'; YLW=$'\033[33m'; RST=$'\033[0m'; else RED=''; GRN=''; YLW=''; RST=''; fi
-
-# Root check
-if [[ ${EUID:-$(id -u)} -ne 0 ]]; then printf '%s\n' "Run as root."; exit 1; fi
-
-# Targets
-SSH_CONFIG_FILE="/etc/ssh/sshd_config"
-ISSUE_FILE="/etc/issue.net"
-TMOUT_FILE="/etc/profile.d/99-timeout.sh"
-AUDIT_DIR="/etc/audit/rules.d"
-AUDIT_RULE="${AUDIT_DIR}/50-sshd.rules"
-TS="$(date +%Y%m%d-%H%M%S)"
-
-# Require sshd_config to exist
-if [ ! -f "$SSH_CONFIG_FILE" ]; then
-  printf '%s\n' "${RED}sshd_config not found at ${SSH_CONFIG_FILE}. Install openssh-server and rerun.${RST}"
-  exit 2
+if [ -t 1 ]; then
+  RED=$'\033[31m' GRN=$'\033[32m' YLW=$'\033[33m'
+  BLD=$'\033[1m'  DIM=$'\033[2m'  RST=$'\033[0m'
+  TICK="${GRN}✓${RST}" CROSS="${RED}✗${RST}"
+else
+  RED='' GRN='' YLW='' BLD='' DIM='' RST=''
+  TICK='OK' CROSS='!!'
 fi
 
-# Backup helper
-backup_file(){ [ -e "$1" ] && cp -a -- "$1" "$1.bak.${TS}"; }
+[[ ${EUID:-$(id -u)} -ne 0 ]] && { printf '%s\n' "Run as root."; exit 1; }
 
-printf '%s\n' "==============================================="
-printf '%s%s%s\n' "$RED" "RU: ВНИМАНИЕ! Скрипт изменит sshd_config и создаст резервные копии." "$RST"
-printf '%s%s%s\n' "$RED" "EN: ATTENTION! The script will modify sshd_config and create backups." "$RST"
-read -r -p "Continue? (y/n): " answer
-[[ "$answer" =~ ^[yY]$ ]] || { printf '%s\n' "Aborted."; exit 1; }
+SSH_CONFIG="/etc/ssh/sshd_config"
+TMOUT_FILE="/etc/profile.d/99-timeout.sh"
+SSHD_BIN="$(command -v sshd 2>/dev/null || printf '/usr/sbin/sshd')"
+TS="$(date +%Y%m%d-%H%M%S)"
+KW=28; VW=14   # column widths
 
-printf '%s%s%s\n' "$GRN" "Proceeding..." "$RST"
+[ -f "$SSH_CONFIG" ] || { printf '%s\n' "${RED}sshd_config not found.${RST}"; exit 2; }
 
-printf '%s%s%s\n' "$GRN" "Backup..." "$RST"
+_SSHD_T=""
+_reload_sshd_t(){ _SSHD_T="$("$SSHD_BIN" -T 2>/dev/null || true)"; }
+_reload_sshd_t
 
-# Backups
-backup_file "$SSH_CONFIG_FILE"
-backup_file "$ISSUE_FILE"
-backup_file "$TMOUT_FILE"
-[ -d "$AUDIT_DIR" ] && backup_file "$AUDIT_RULE"
+_sshd_val(){ printf '%s' "$_SSHD_T" | awk -v k="$1" 'tolower($1)==tolower(k){print $2; exit}'; }
 
-printf '%s%s%s\n' "$GRN" "Hardening ssh config..." "$RST"
-# Ensure/replace option in sshd_config
-ensure_option(){
+_ensure(){
   local key="$1" val="$2"
-  if grep -Eq "^[[:space:]]*#?[[:space:]]*$key([[:space:]]+|$)" "$SSH_CONFIG_FILE" 2>/dev/null; then
-    sed -ri "s|^[[:space:]]*#?[[:space:]]*$key[[:space:]].*|$key $val|" "$SSH_CONFIG_FILE"
+  if grep -Eiq "^[[:space:]]*#?[[:space:]]*${key}([[:space:]]+|$)" "$SSH_CONFIG" 2>/dev/null; then
+    sed -ri "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]].*|${key} ${val}|I" "$SSH_CONFIG"
   else
-    printf '%s %s\n' "$key" "$val" >>"$SSH_CONFIG_FILE"
+    printf '%s %s\n' "$key" "$val" >> "$SSH_CONFIG"
   fi
 }
 
-# SSH hardening
-ensure_option PubkeyAuthentication        yes
-ensure_option ClientAliveInterval         300
-ensure_option ClientAliveCountMax         0
-ensure_option PermitRootLogin             no
-# Protocol 2 не задаём (устарело)
-ensure_option PasswordAuthentication      no
-ensure_option MaxAuthTries                3
-ensure_option X11Forwarding               no
-ensure_option AllowAgentForwarding        no
-ensure_option GSSAPIAuthentication        no
-ensure_option LogLevel                    INFO
-ensure_option LoginGraceTime              60
-ensure_option MaxSessions                 4
-ensure_option IgnoreRhosts                yes
-ensure_option HostbasedAuthentication     no
-ensure_option PermitEmptyPasswords        no
-ensure_option PermitUserEnvironment       no
-ensure_option UsePAM                      yes
-ensure_option Banner                      /etc/issue.net
-ensure_option Ciphers                     'chacha20-poly1305@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr'
-ensure_option MACs                        'hmac-sha2-512,hmac-sha2-256'
-ensure_option KexAlgorithms               'curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256,diffie-hellman-group14-sha256'
-# ensure_option AllowUsers                 'adminops ansible'
-# ensure_option AllowGroups                'sshusers'
+# ─── Audit state ─────────────────────────────────────────────────────────────
+PASS=0; FAIL=0
+FAIL_ORDER=()
+declare -A FAILED FAILED_CURRENT FAILED_DESC
 
-# TMOUT
-umask 022
-printf '%s\n' "TMOUT=900" "export TMOUT" > "$TMOUT_FILE"
-chmod 0644 "$TMOUT_FILE"
+_reset_state(){
+  PASS=0; FAIL=0; FAIL_ORDER=()
+  unset FAILED FAILED_CURRENT FAILED_DESC
+  declare -gA FAILED FAILED_CURRENT FAILED_DESC
+}
 
-printf '%s%s%s\n' "$GRN" "Banner create..." "$RST"
-# Banner
-printf '%s\n' 'Unauthorized access prohibited.' > "$ISSUE_FILE"
-chown root:root "$ISSUE_FILE"
-chown root:root "$SSH_CONFIG_FILE"
-chmod 0600 "$SSH_CONFIG_FILE"
+_row(){
+  local ok="$1" key="$2" actual="$3" expected="$4" desc="$5"
+  if [ "$ok" = "1" ]; then
+    printf '  [%s] %-*s %s%-*s%s  %s%s%s\n' \
+      "$TICK" $KW "$key" "$GRN" $VW "$actual" "$RST" "$DIM" "$desc" "$RST"
+    (( PASS++ )) || true
+  else
+    printf '  [%s] %-*s %s%-*s%s → %s%s%s  %s%s%s\n' \
+      "$CROSS" $KW "$key" "$RED" $VW "$actual" "$RST" \
+      "$GRN" "$expected" "$RST" "$DIM" "$desc" "$RST"
+    (( FAIL++ )) || true
+    FAILED["$key"]="$expected"
+    FAILED_CURRENT["$key"]="$actual"
+    FAILED_DESC["$key"]="$desc"
+    FAIL_ORDER+=("$key")
+  fi
+}
 
-printf '%s%s%s\n' "$GRN" "Create audit rules..." "$RST"
-# Local audit rule (optional). Guard for missing auditd.
-if [ -d "$AUDIT_DIR" ]; then
-  printf '%s\n' '-w /etc/ssh/sshd_config -p wa -k sshd_cfg' > "$AUDIT_RULE"
-  { command -v augenrules >/dev/null && augenrules --load; } || \
-  { command -v systemctl >/dev/null && systemctl restart auditd 2>/dev/null; } || \
-  { command -v service   >/dev/null && service auditd restart 2>/dev/null; } || true
+_divider(){ printf '  %s\n' "$(printf '─%.0s' {1..72})"; }
+_section(){ printf '\n  %s%s%s\n' "$DIM" "$1" "$RST"; }
+
+# ─── Checks ──────────────────────────────────────────────────────────────────
+_chk(){
+  local key="$1" expected="$2" desc="$3"
+  local actual; actual="$(_sshd_val "$key")"
+  local al; al="$(printf '%s' "${actual:-}" | tr '[:upper:]' '[:lower:]')"
+  local el; el="$(printf '%s' "$expected"   | tr '[:upper:]' '[:lower:]')"
+  [ "$al" = "$el" ] && _row 1 "$key" "${actual:--}" "$expected" "$desc" \
+                     || _row 0 "$key" "${actual:-not set}" "$expected" "$desc"
+}
+
+_chk_crypto(){
+  local key="$1" expected="$2" desc="$3"
+  local actual; actual="$(_sshd_val "$key")"
+  [ "$actual" = "$expected" ] \
+    && _row 1 "$key" "CIS compliant" "$expected" "$desc" \
+    || _row 0 "$key" "non-CIS" "$expected" "$desc"
+}
+
+_chk_loglevel(){
+  local actual; actual="$(_sshd_val "loglevel")"
+  local al; al="$(printf '%s' "${actual:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$al" in
+    info|verbose|debug*) _row 1 "loglevel" "${actual:-INFO}" "INFO+" "Logging level sufficient" ;;
+    *) _row 0 "loglevel" "${actual:-not set}" "INFO" "Logging level sufficient" ;;
+  esac
+}
+
+_chk_banner(){
+  local actual; actual="$(_sshd_val "banner")"
+  [ -n "${actual:-}" ] && [ "$actual" != "none" ] \
+    && _row 1 "banner" "$actual" "/etc/issue.net" "Warning banner on connect" \
+    || _row 0 "banner" "${actual:-not set}" "/etc/issue.net" "Warning banner on connect"
+}
+
+_chk_tmout(){
+  if grep -q 'TMOUT=900' "${TMOUT_FILE}" 2>/dev/null; then
+    printf '  [%s] %-*s %s%-*s%s  %s%s%s\n' \
+      "$TICK" $KW "TMOUT (profile.d)" "$GRN" $VW "900" "$RST" "$DIM" "Session idle timeout" "$RST"
+    (( PASS++ )) || true
+  else
+    printf '  [%s] %-*s %s%-*s%s → %s%s%s  %s%s%s\n' \
+      "$CROSS" $KW "TMOUT (profile.d)" "$RED" $VW "not set" "$RST" \
+      "$GRN" "900" "$RST" "$DIM" "Session idle timeout" "$RST"
+    (( FAIL++ )) || true
+    FAILED["TMOUT"]="900"
+    FAILED_CURRENT["TMOUT"]="not set"
+    FAILED_DESC["TMOUT"]="Session idle timeout (readonly TMOUT=900 in /etc/profile.d)"
+    FAIL_ORDER+=("TMOUT")
+  fi
+}
+
+_chk_cfg_perms(){
+  local p; p="$(stat -c '%a' "$SSH_CONFIG" 2>/dev/null || printf '???')"
+  [ "$p" = "600" ] \
+    && _row 1 "sshd_config perms" "$p" "600" "Config readable only by root" \
+    || _row 0 "sshd_config perms" "$p"  "600" "Config readable only by root"
+}
+
+_chk_ssh_dir_perms(){
+  local bad=0 dirs=""
+  shopt -s nullglob
+  for d in /root/.ssh /home/*/.ssh; do
+    [ -d "$d" ] || continue
+    local dp; dp="$(stat -c '%a' "$d" 2>/dev/null || printf '???')"
+    [ "$dp" != "700" ] && { bad=1; dirs="${dirs} ${d}(${dp})"; }
+  done
+  for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+    [ -f "$f" ] || continue
+    local fp; fp="$(stat -c '%a' "$f" 2>/dev/null || printf '???')"
+    [ "$fp" != "600" ] && { bad=1; dirs="${dirs} ${f}(${fp})"; }
+  done
+  shopt -u nullglob
+  if [ "$bad" -eq 0 ]; then
+    _row 1 ".ssh dir/key perms" "700/600" "700/600" ".ssh=700, authorized_keys=600"
+  else
+    _row 0 ".ssh dir/key perms" "wrong:${dirs}" "700/600" ".ssh=700, authorized_keys=600"
+  fi
+}
+
+# ─── Pre-flight info ──────────────────────────────────────────────────────────
+_KEY_COUNT=-1
+_SUDO_COUNT=-1
+
+_count_keys(){
+  [ "$_KEY_COUNT" -ge 0 ] && { printf '%d' "$_KEY_COUNT"; return; }
+  local count=0 n f
+  shopt -s nullglob
+  for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+    [ -f "$f" ] || continue
+    n="$(grep -cE '^(ssh-|ecdsa-|sk-)' "$f" 2>/dev/null || true)"
+    (( count += n )) || true
+  done
+  shopt -u nullglob
+  _KEY_COUNT=$count
+  printf '%d' "$count"
+}
+
+_count_sudo(){
+  [ "$_SUDO_COUNT" -ge 0 ] && { printf '%d' "$_SUDO_COUNT"; return; }
+  local count=0 members
+  for grp in sudo wheel; do
+    getent group "$grp" >/dev/null 2>&1 || continue
+    members="$(getent group "$grp" | cut -d: -f4)"
+    [ -n "$members" ] && (( count += $(printf '%s' "$members" | tr ',' '\n' | grep -c .) )) || true
+  done
+  _SUDO_COUNT=$count
+  printf '%d' "$count"
+}
+
+_show_preflight(){
+  local kc; kc="$(_count_keys)"
+  local sc; sc="$(_count_sudo)"
+  local au; au="$(_sshd_val "allowusers")"
+  local ag; ag="$(_sshd_val "allowgroups")"
+
+  printf '\n  %sSystem snapshot%s\n' "$BLD" "$RST"
+  _divider
+  if [ "$kc" -gt 0 ]; then
+    printf '  %s✓%s  Authorized SSH keys: %s%d%s\n' "$GRN" "$RST" "$GRN" "$kc" "$RST"
+  else
+    printf '  %s⚠%s  Authorized SSH keys: %s0 — DANGER if password auth disabled!%s\n' "$RED" "$RST" "$RED" "$RST"
+  fi
+  if [ "$sc" -gt 0 ]; then
+    printf '  %s✓%s  Sudo/wheel users:    %s%d%s\n' "$GRN" "$RST" "$GRN" "$sc" "$RST"
+  else
+    printf '  %s⚠%s  Sudo/wheel users:    %s0 — DANGER if root login disabled!%s\n' "$RED" "$RST" "$RED" "$RST"
+  fi
+  printf '  %s   AllowUsers:%s          %s\n' "$DIM" "$RST" "${au:-not set (all users allowed)}"
+  printf '  %s   AllowGroups:%s         %s\n' "$DIM" "$RST" "${ag:-not set (all groups allowed)}"
+  _divider
+}
+
+# ─── CIS crypto values ────────────────────────────────────────────────────────
+CIPHERS='chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr'
+MACS='hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256'
+KEX='curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256,diffie-hellman-group16-sha512,diffie-hellman-group14-sha256'
+
+# ─── Full audit ───────────────────────────────────────────────────────────────
+run_audit(){
+  _reset_state
+
+  printf '\n  %s%-*s %-*s   %s\n' "$BLD" $KW "CHECK" $VW "CURRENT" "DESCRIPTION$RST"
+  _divider
+
+  _section "Authentication"
+  _chk pubkeyauthentication    yes  "SSH key auth enabled"
+  _chk passwordauthentication  no   "Password login disabled"
+  _chk permitrootlogin         no   "Root login disabled"
+  _chk permitemptypasswords    no   "Empty passwords blocked"
+  _chk permituserenvironment   no   "User env injection blocked"
+  _chk gssapiauthentication    no   "GSSAPI/Kerberos disabled"
+  _chk ignorerhosts            yes  "Rhosts files ignored"
+  _chk hostbasedauthentication no   "Host-based auth disabled"
+  _chk usepam                  yes  "PAM integration active"
+
+  _section "Session limits"
+  _chk clientaliveinterval     300  "Keepalive interval (s)"
+  _chk clientalivecountmax     3    "Missed keepalives → disconnect"
+  _chk logingracetime          60   "Login grace period (s)"
+  _chk maxauthtries            3    "Max auth attempts"
+  _chk maxsessions             4    "Max sessions per connection"
+
+  _section "Forwarding / tunneling"
+  _chk x11forwarding           no   "X11 display forwarding"
+  _chk allowagentforwarding    no   "SSH agent forwarding"
+  _chk allowtcpforwarding      no   "TCP port forwarding"
+  _chk gatewayports            no   "Remote port binding"
+  _chk permittunnel            no   "VPN tunneling"
+  _chk tcpkeepalive            no   "TCP keepalive (spoof risk)"
+
+  _section "Misc"
+  _chk strictmodes             yes  "Strict file permission checks"
+  _chk printlastlog            yes  "Show last login on connect"
+  _chk_loglevel
+  _chk_banner
+  _chk_tmout
+
+  _section "File permissions"
+  _chk_cfg_perms
+  _chk_ssh_dir_perms
+
+  _section "Crypto (CIS)"
+  _chk_crypto ciphers        "$CIPHERS" "Allowed ciphers"
+  _chk_crypto macs           "$MACS"    "Allowed MACs"
+  _chk_crypto kexalgorithms  "$KEX"     "Key exchange algorithms"
+
+  _divider
+}
+
+# ─── Apply single fix ─────────────────────────────────────────────────────────
+_apply_one(){
+  local k="$1" v="$2"
+  case "$k" in
+    TMOUT)
+      [ -d /etc/profile.d ] && {
+        umask 022
+        printf '%s\n' "readonly TMOUT=900" "export TMOUT" > "$TMOUT_FILE"
+        chmod 0644 "$TMOUT_FILE"
+      } ;;
+    banner)
+      printf '%s\n' 'Authorized access only. All sessions are monitored and recorded.' \
+        > /etc/issue.net
+      chown root:root /etc/issue.net
+      _ensure Banner /etc/issue.net ;;
+    ciphers)           _ensure Ciphers       "$CIPHERS" ;;
+    macs)              _ensure MACs          "$MACS" ;;
+    kexalgorithms)     _ensure KexAlgorithms "$KEX" ;;
+    loglevel)          _ensure LogLevel      "INFO" ;;
+    sshd_config\ perms)
+      chown root:root "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG" ;;
+    .ssh\ dir/key\ perms)
+      shopt -s nullglob
+      for d in /root/.ssh /home/*/.ssh;                                  do chmod 700 "$d" || true; done
+      for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys;  do chmod 600 "$f" || true; done
+      shopt -u nullglob ;;
+    *) _ensure "$k" "$v" ;;
+  esac
+}
+
+# ─── Interactive fix loop ────────────────────────────────────────────────────
+_fix_interactive(){
+  local total=${#FAIL_ORDER[@]}
+  local i=0 fixed=0
+
+  for k in "${FAIL_ORDER[@]}"; do
+    (( i++ )) || true
+    local v="${FAILED[$k]}"
+    local cur="${FAILED_CURRENT[$k]:-?}"
+    local desc="${FAILED_DESC[$k]:-}"
+
+    printf '\n'
+    printf '  ┌── [%d/%d] %s%s%s\n' "$i" "$total" "$BLD" "$k" "$RST"
+    printf '  │  %s%s%s\n' "$DIM" "$desc" "$RST"
+    printf '  │  Current: %s%s%s  →  Expected: %s%s%s\n' \
+      "$RED" "$cur" "$RST" "$GRN" "$v" "$RST"
+
+    # Safety warnings
+    case "$k" in
+      passwordauthentication)
+        local kc; kc="$(_count_keys)"
+        if [ "$kc" -eq 0 ]; then
+          printf '  │  %s⚠  0 authorized keys found — disabling passwords = LOCKOUT!%s\n' "$RED" "$RST"
+        else
+          printf '  │  %s✓  %d authorized key(s) found — safe to disable passwords%s\n' "$GRN" "$kc" "$RST"
+        fi ;;
+      permitrootlogin)
+        local sc; sc="$(_count_sudo)"
+        if [ "$sc" -eq 0 ]; then
+          printf '  │  %s⚠  No sudo/wheel users found — disabling root login = LOCKOUT!%s\n' "$RED" "$RST"
+        else
+          printf '  │  %s✓  %d sudo/wheel user(s) found — safe to disable root login%s\n' "$GRN" "$sc" "$RST"
+        fi ;;
+    esac
+
+    local action
+    case "$k" in
+      TMOUT)                action="Write readonly TMOUT=900 → $TMOUT_FILE" ;;
+      banner)               action="Create /etc/issue.net  +  set Banner $SSH_CONFIG" ;;
+      ciphers)              action="Set Ciphers (CIS list) in $SSH_CONFIG" ;;
+      macs)                 action="Set MACs (CIS list) in $SSH_CONFIG" ;;
+      kexalgorithms)        action="Set KexAlgorithms (CIS list) in $SSH_CONFIG" ;;
+      loglevel)             action="Set LogLevel INFO in $SSH_CONFIG" ;;
+      "sshd_config perms")  action="chown root:root + chmod 600 $SSH_CONFIG" ;;
+      ".ssh dir/key perms") action="chmod 700 ~/.ssh dirs, chmod 600 authorized_keys files" ;;
+      *)                    action="Set $k $v in $SSH_CONFIG" ;;
+    esac
+    printf '  │  %sAction:%s %s\n' "$YLW" "$RST" "$action"
+    printf '  └──────────────────────────────────────────────────────────────\n'
+    read -rp "  [f]ix  [s]kip  [q]uit → " _a </dev/tty || _a="s"
+    case "${_a:-s}" in
+      f|F)
+        _apply_one "$k" "$v"
+        printf '  %s→ Applied%s\n' "$GRN" "$RST"
+        (( fixed++ )) || true ;;
+      q|Q)
+        printf '  Quit.\n'; break ;;
+      *)
+        printf '  %s→ Skipped%s\n' "$DIM" "$RST" ;;
+    esac
+  done
+  printf '\n'
+  _FIX_COUNT="$fixed"
+}
+
+# ─── Auto-fix (no prompt) ────────────────────────────────────────────────────
+_fix_all(){
+  local total=${#FAIL_ORDER[@]} i=0
+  for k in "${FAIL_ORDER[@]}"; do
+    (( i++ )) || true
+    local v="${FAILED[$k]}"
+    printf '  [%d/%d] %s%-*s%s → applying...\n' "$i" "$total" "$BLD" 28 "$k" "$RST"
+    _apply_one "$k" "$v"
+    printf '  %s→ Done%s\n' "$GRN" "$RST"
+  done
+  _FIX_COUNT="$total"
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+AUTO_FIX=0
+for _arg in "$@"; do
+  case "$_arg" in --fix|-f) AUTO_FIX=1 ;; esac
+done
+
+printf '\n%s' "$BLD"
+printf '  ══════════════════════════════════════════════════════════════════\n'
+printf '    OpenSSH Hardening Audit — Expice Security\n'
+printf '    %s\n' "$SSH_CONFIG"
+printf '  ══════════════════════════════════════════════════════════════════%s\n' "$RST"
+
+_show_preflight
+
+# ── Phase 1: audit ────────────────────────────────────────────────────────────
+run_audit
+
+T=$(( PASS + FAIL ))
+if [ "$FAIL" -eq 0 ]; then
+  printf '\n  %s%s✓ All %d checks passed.%s\n\n' "$BLD" "$GRN" "$T" "$RST"
+  exit 0
 fi
 
-printf '%s%s%s\n' "$GRN" "Fix perms for users directory..." "$RST"
-# Fix ~/.ssh perms safely
-shopt -s nullglob
-for d in /home/*/.ssh; do chmod 0700 "$d" || true; done
-for f in /home/*/.ssh/authorized_keys; do chmod 0600 "$f" || true; done
-shopt -u nullglob
+printf '\n  %sResults: %s%d passed%s  %s%d failed%s  (total %d)\n' \
+  "$BLD" "$GRN" "$PASS" "$RST" "$RED" "$FAIL" "$RST" "$T"
 
-printf '%s%s%s\n' "$GRN" "Validate SSH settings..." "$RST"
-# Validate before restart
-SSHD_BIN="$(command -v sshd || echo /usr/sbin/sshd)"
-if ! "$SSHD_BIN" -t -f "$SSH_CONFIG_FILE" 2>/tmp/sshd_check.err; then
-  printf '%s\n' "${RED}[ERROR] sshd_config test failed. Restoring backup.${RST}"
-  mv -f "${SSH_CONFIG_FILE}.bak.${TS}" "$SSH_CONFIG_FILE"
-  cat /tmp/sshd_check.err
-  exit 1
+# ── Phase 2: fix ──────────────────────────────────────────────────────────────
+if [ "$AUTO_FIX" -eq 0 ]; then
+  printf '\n'
+  read -rp "  [y] fix all  [f] interactive  [n] exit → " _ans </dev/tty || _ans="n"
+  case "${_ans:-n}" in
+    y|Y) AUTO_FIX=1 ;;
+    f|F) AUTO_FIX=0 ;;
+    *)   printf '  Skipped.\n'; exit 0 ;;
+  esac
 fi
-rm -f /tmp/sshd_check.err
 
-printf '%s\n' "==============================================="
-printf '%s%s%s\n' "$YLW" "RU: Перезапустить SSH сейчас? Это включит вход только по ключам и разорвёт текущую сессию!" "$RST"
-printf '%s%s%s\n' "$YLW" "EN: Should I restart SSH now? This will enable key-only login and terminate the current session!" "$RST"
+cp -a -- "$SSH_CONFIG" "${SSH_CONFIG}.bak.${TS}"
+printf '  %sBackup: %s.bak.%s%s\n' "$DIM" "$SSH_CONFIG" "$TS" "$RST"
 
-read -r -p "Restart SSH? (y/n): " restart_ssh
-if [[ "$restart_ssh" =~ ^[yY]$ ]]; then
-  UNIT="sshd"; systemctl list-unit-files | grep -q '^ssh\.service' && UNIT="ssh" || true
-  printf '%s%s%s\n' "$GRN" "Restarting ${UNIT}..." "$RST"
-  systemctl restart "$UNIT"
-  systemctl --no-pager status "$UNIT" --lines=0 || true
+FIXED=0
+if [ "$AUTO_FIX" -eq 1 ]; then
+  printf '\n  %sApplying all %d fixes...%s\n\n' "$YLW" "$FAIL" "$RST"
+  _fix_all
 else
-  printf '%s\n' "Restart skipped. Apply later: systemctl restart sshd|ssh"
+  _fix_interactive
+fi
+FIXED="$_FIX_COUNT"
+
+if [ "${FIXED:-0}" -gt 0 ]; then
+  printf '%s  Validating config...%s\n' "$BLD" "$RST"
+  local_err="$(mktemp)"
+  if ! "$SSHD_BIN" -t -f "$SSH_CONFIG" 2>"$local_err"; then
+    printf '%s\n' "${RED}  Config FAILED — restoring backup.${RST}"
+    mv -f "${SSH_CONFIG}.bak.${TS}" "$SSH_CONFIG"
+    cat "$local_err"; rm -f "$local_err"; exit 1
+  fi
+  rm -f "$local_err"
+  printf '  %s✓ Config OK%s\n' "$GRN" "$RST"
+
+  # ── Phase 3: re-audit ──────────────────────────────────────────────────────
+  printf '\n%s' "$BLD"
+  printf '  ══════════════════════════════════════════════════════════════════\n'
+  printf '    Re-checking after fixes\n'
+  printf '  ══════════════════════════════════════════════════════════════════%s\n' "$RST"
+
+  _reload_sshd_t
+  run_audit
+
+  T=$(( PASS + FAIL ))
+  if [ "$FAIL" -eq 0 ]; then
+    printf '\n  %s%s✓ All %d checks passed.%s\n' "$BLD" "$GRN" "$T" "$RST"
+  else
+    printf '\n  %sResults: %s%d passed%s  %s%d still failing%s\n' \
+      "$BLD" "$GRN" "$PASS" "$RST" "$RED" "$FAIL" "$RST"
+  fi
 fi
 
-printf '%s%s%s\n' "$GRN" "Done. Backups:" "$RST"
-printf '%s\n' "${SSH_CONFIG_FILE}.bak.${TS}"
-[ -e "${ISSUE_FILE}.bak.${TS}" ]  && printf '%s\n' "${ISSUE_FILE}.bak.${TS}"
-[ -e "${TMOUT_FILE}.bak.${TS}" ]  && printf '%s\n' "${TMOUT_FILE}.bak.${TS}"
-[ -e "${AUDIT_RULE}.bak.${TS}" ]  && printf '%s\n' "${AUDIT_RULE}.bak.${TS}"
+printf '\n  %sRestart SSH to apply: systemctl restart sshd|ssh%s\n\n' "$DIM" "$RST"
