@@ -2,7 +2,7 @@
 #==========================================
 #  OpenSSH CIS hardening — TUI checklist
 #  whiptail / CLI fallback, auto-installs TUI if missing
-#  Anton Palamarchuk (info@expice.ru) 14102025
+#  Anton Palamarchuk (info@expice.ru) 090726
 #==========================================
 
 # MUST come before set -Eeuo — sh has no pipefail
