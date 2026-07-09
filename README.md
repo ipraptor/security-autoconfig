@@ -10,7 +10,6 @@ Bash scripts that apply CIS‑aligned OpenSSH hardening. They back up files, edi
 
 ## Содержимое репозитория / Repository layout
 - `ssh-autohardening.sh` — базовый non‑TUI вариант с подтверждениями `Y/N`.
-<img width="731" height="318" alt="Screenshot 2025-10-14 110953" src="https://github.com/user-attachments/assets/3d3734ba-5894-4a0a-8e75-831967f2509c" />
 
 
 - `pgi-ssh-hardening.sh` — TUI‑версия с чекбоксами (whiptail/dialog) и подменю выбора пользователей для `AllowUsers`.
